@@ -6,7 +6,7 @@ import webbrowser
 from queue import Queue
 import plyer
 
-import keyboard
+from pynput import keyboard
 from PIL import Image, ImageDraw
 from pystray import Icon, Menu, MenuItem
 
@@ -90,86 +90,94 @@ class KeyboardLock:
             self.hotkey_thread.join()
 
         with self.hotkey_lock:
-
             hotkey_window = tk.Tk()
             hotkey_window.title("Set Hotkey")
             hotkey_window.geometry("300x150")
             hotkey_window.attributes('-topmost', True)
 
+            hotkey_set = False  # Flag to indicate if hotkey has been set
+            entered_keys = []  # List to store the entered keys
+
             def on_closing():
+                nonlocal hotkey_set
                 hotkey_window.destroy()
+                if not hotkey_set:
+                    hotkey_listener.stop()  # Stop the listener if hotkey is not set
                 self.start_hotkey_listener_thread()
+
+            def on_key_press(key):
+                nonlocal entered_keys
+                entered_keys.append(keyboard.from_char(key))
+                update_hotkey_entry()
+
+            def update_hotkey_entry():
+                hotkey_entry.config(state='normal')
+                hotkey_entry.delete(0, 'end')
+                hotkey_entry.insert(tk.END, '+'.join(entered_keys))
+                hotkey_entry.config(state='readonly')
+
+            def confirm_hotkey():
+                nonlocal hotkey_set
+                hotkey_set = True
+                self.set_hotkey('+'.join(entered_keys))
+                print(f"Key Unlocked {self.hotkey}")
+                print(f"Hotkey changed to: {self.hotkey}")
+                on_closing()
+
+            def cancel_hotkey():
+                on_closing()
 
             hotkey_window.protocol("WM_DELETE_WINDOW", on_closing)
 
-            label = tk.Label(hotkey_window, text="Enter a new hotkey:")
+            label = tk.Label(hotkey_window, text="Press keys for hotkey:")
             label.pack(pady=10)
 
             hotkey_entry = tk.Entry(hotkey_window, width=20)
             hotkey_entry.config(state='readonly')
-            entry_queue = Queue()
-
-            def poll_queue():
-                while True:
-                    if not entry_queue.empty():
-                        keys_pressed = entry_queue.get(block=False)
-                        hotkey_entry.config(state='normal')
-                        hotkey_entry.delete(0, 'end')
-                        hotkey_entry.insert(tk.END, keys_pressed)
-                        hotkey_entry.config(state='readonly')
-                        keyboard.stash_state()
-                        start_entry_listener_thread()
-                    break
-                hotkey_window.after(100, poll_queue)
-
-            def set_hotkey_from_gui():
-                new_hotkey = hotkey_entry.get()
-                if new_hotkey:
-                    self.set_hotkey(new_hotkey)
-                    print(f"Key Unlocked {self.hotkey}")
-                    print(f"Hotkey changed to: {new_hotkey}")
-                    on_closing()
-                else:
-                    label.config(text="Invalid hotkey, try again.")
-
-            set_hotkey_button = tk.Button(hotkey_window, text="Set Hotkey", command=set_hotkey_from_gui)
             hotkey_entry.pack(pady=10)
-            hotkey_entry.focus_force()
-            set_hotkey_button.pack(pady=10)
 
-        def read_user_inp():
-            hotkey = keyboard.read_hotkey()
-            entry_queue.put(hotkey)
-            time.sleep(.5)
+            confirm_button = tk.Button(hotkey_window, text="Confirm", command=confirm_hotkey)
+            confirm_button.pack(pady=5)
 
-        entry_listener_thread = None
+            cancel_button = tk.Button(hotkey_window, text="Cancel", command=cancel_hotkey)
+            cancel_button.pack(pady=5)
 
-        def start_entry_listener_thread():
-            nonlocal entry_listener_thread
-            if entry_listener_thread and entry_listener_thread.is_alive():
-                entry_listener_thread.join()
-            keyboard.stash_state()
-            entry_listener_thread = threading.Thread(target=read_user_inp, daemon=True)
-            entry_listener_thread.start()
+            # Initialize the hotkey listener
+            hotkey_listener = keyboard.Listener(on_press=on_key_press, suppress=True)
+            hotkey_listener.start()
 
-        start_entry_listener_thread()
-        hotkey_window.after(100, poll_queue)
         hotkey_window.mainloop()
 
     def lock_keyboard(self):
         self.blocked_keys.clear()
-        for i in range(150):
-            keyboard.block_key(i)
-            self.blocked_keys.add(i)
+        controller = keyboard.Controller()
+        # Simulate pressing an invalid key for each key code in the range
+        # for i in range(150):
+        #     try:
+        #         key = keyboard.KeyCode.from_vk(i)
+        #         if key:
+        #             controller.press(key)
+        #             controller.release(key)
+        #             self.blocked_keys.add(i)
+        #     except Exception as e:
+        #         print(f"Error occurred while simulating key press: {e}")
         self.send_notification_in_thread()
 
     def unlock_keyboard(self, event=None):
-        for key in self.blocked_keys:
-            keyboard.unblock_key(key)
-        self.blocked_keys.clear()
-
-        # Manually release the hotkey keys to ensure they're not stuck
-        keyboard.release(self.hotkey)
+        controller = keyboard.Controller()
+        keys = self.hotkey.split('+')
+        for key in keys:
+            key = key.strip().lower()
+            if key.startswith('<') and key.endswith('>'):
+                key = key[1:-1]  # Remove angle brackets
+                if key == 'ctrl':
+                    controller.release(keyboard.Key.ctrl)
+                elif key == 'shift':
+                    controller.release(keyboard.Key.shift)
+                elif key == 'alt':
+                    controller.release(keyboard.Key.alt)
+            else:
+                controller.release(keyboard.KeyCode.from_char(key))
         print(f"Keyboard Unlocked {self.hotkey}")
         if self.root:
             self.root.destroy()
@@ -191,7 +199,6 @@ class KeyboardLock:
         self.show_change_hotkey_queue.put(True)
 
     def start_hotkey_listener_thread(self):
-        keyboard.stash_state()
         with self.hotkey_lock:
             self.listen_for_hotkey = True
             if self.hotkey_thread and threading.current_thread() is not self.hotkey_thread and self.hotkey_thread.is_alive():
@@ -200,10 +207,10 @@ class KeyboardLock:
             self.hotkey_thread.start()
 
     def hotkey_listener(self):
-        keyboard.add_hotkey(self.hotkey, self.send_hotkey_signal)
-        while self.listen_for_hotkey:
-            time.sleep(1)
-        keyboard.remove_hotkey(self.hotkey)
+        with keyboard.GlobalHotKeys({self.hotkey: self.send_hotkey_signal}) as h:
+            while not self.listen_for_hotkey:
+                h.stop()
+                h.join()
 
     def create_tray_icon(self):
         image = Image.open("../resources/img/icon.png")
